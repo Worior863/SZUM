@@ -1,0 +1,188 @@
+%% Prawa ręka
+% 
+[rArm, rGoalMsg] = rosactionclient('r_arm_controller/joint_trajectory_action');
+waitForServer(rArm);
+
+%wszystkie parametry ramienia 
+
+rGoalMsg.Trajectory.JointNames = {'r_shoulder_pan_joint', ...
+                                   'r_shoulder_lift_joint', ...
+                                   'r_upper_arm_roll_joint', ...
+                                   'r_elbow_flex_joint',...
+                                   'r_forearm_roll_joint',...
+                                   'r_wrist_flex_joint',...
+                                   'r_wrist_roll_joint'};
+% 
+% Point 1
+tjPoint1 = rosmessage('trajectory_msgs/JointTrajectoryPoint');
+tjPoint1.Positions = zeros(1,7);
+tjPoint1.Velocities = zeros(1,7);
+tjPoint1.TimeFromStart = rosduration(1.0);
+
+% Point 2
+tjPoint2 = rosmessage('trajectory_msgs/JointTrajectoryPoint');
+tjPoint2.Positions = [-1.0 0.2 0.1 -1.2 -1.5 -0.3 -0.5];
+tjPoint2.Velocities = zeros(1,7);
+tjPoint2.TimeFromStart = rosduration(2.0);
+
+
+
+%% Lewa ręka
+
+[lArm, lGoalMsg] = rosactionclient('l_arm_controller/joint_trajectory_action');
+waitForServer(lArm);
+% 
+lGoalMsg.Trajectory.JointNames = {'l_shoulder_pan_joint', ...
+                                   'l_shoulder_lift_joint', ...
+                                   'l_upper_arm_roll_joint', ...
+                                   'l_elbow_flex_joint',...
+                                   'l_forearm_roll_joint',...
+                                   'l_wrist_flex_joint',...
+                                   'l_wrist_roll_joint'};
+                               
+
+
+%% Wizualizacja konfiguracji robota
+
+% robot zaladowany jako obiekt rigidBodyTree
+% ten obiekt definiuje wszystkie parametry kinematyczne 
+% (w tym granice polaczen robota)
+pr2 = exampleHelperWGPR2Kinect;
+
+% dostep do stanow czlonow robota
+jointSub = rossubscriber('joint_states');
+
+% pobranie komunikatu o biezacym stanie
+jntState = receive(jointSub);
+
+% przypisanie pozycji z komuniaktu powyzej do struktury zrozumialej dla
+% obiektu p2
+jntPos = exampleHelperJointMsgToStruct(pr2,jntState);
+
+% wizualizacja robota
+show(pr2,jntPos)
+
+%% kinematyka odwrotna
+
+torsoJoint = pr2.getBody('torso_lift_link').Joint;
+idx = strcmp({jntPos.JointName}, torsoJoint.Name);
+torsoJoint.HomePosition = jntPos(idx).JointPosition;
+torsoJoint.PositionLimits = jntPos(idx).JointPosition + [-1e-3,1e-3];
+
+% obiekt odwrotnej kinematyki
+ik = robotics.InverseKinematics('RigidBodyTree', pr2);
+
+% wylaczenie randomowego restartu
+ik.SolverParameters.AllowRandomRestart = false;
+
+
+weights = [0.25 0.25 0.25 1 1 1];
+initialGuess = jntPos; % current jnt pos as initial guess
+
+% koncowka chwytaka
+endEffectorName = 'r_gripper_tool_frame';
+
+
+% pozycje puszki
+TCanInitial = trvec2tform([0.6, 0,0.462421]); %poczatkowa
+TCanFinal = trvec2tform([0.6, -0.5, 0.462421]); %koncowa
+TGraspToCan = trvec2tform([0.025,0,0.06])*eul2tform([pi/8,0,-pi]); %kąt z jakim robot ma podjechać do puszki
+
+%zacisniecie
+TGrasp = TCanInitial*TGraspToCan; % Żądana pozycja koncówki robota podczas łapania puszki
+
+% punkty
+
+T1=TGrasp*trvec2tform([-0.1,0,-0.2]);
+T2 = TGrasp*trvec2tform([0.,0,-0.1]);
+T3 = TGrasp*trvec2tform([0,0,-0.2]);
+T4 = TCanFinal*TGraspToCan*trvec2tform([0,0,-0.2]);
+TRelease = TCanFinal*TGraspToCan; % Żądana pozycja koncówki robota podczas puszczenia puszki
+T5 = T3*trvec2tform([-0.1,0,0]);
+exampleHelperSendPR2GripperCommand('r',0.0,-1)
+rGoalMsg.Trajectory.Points = tjPoint2;
+sendGoal(rArm, rGoalMsg);
+%% ruch
+
+
+ motionTask = {'Release', T1,T2, TGrasp, 'Grasp', T3,T4, TRelease, 'Release', T5};
+
+for i = 1: length(motionTask)
+    
+    if strcmp(motionTask{i}, 'Grasp')
+        exampleHelperSendPR2GripperCommand('right',0.0,500,true); 
+        continue
+    end
+    
+    if strcmp(motionTask{i}, 'Release')
+        exampleHelperSendPR2GripperCommand('right',0.1,-1,true);
+        continue
+    end  
+    
+    Tf = motionTask{i};
+    %Zdobycie aktualnego stanu polaczen w robocie
+    jntState = receive(jointSub);
+    jntPos = exampleHelperJointMsgToStruct(pr2, jntState);
+    
+    T0 = getTransform(pr2, jntPos, endEffectorName);  
+    
+    % Interpolacja miedzy punktami ruchu
+    numWaypoints = 10;
+    TWaypoints = exampleHelperSE3Trajectory(T0, Tf, numWaypoints); % end-effector pose waypoints
+    jntPosWaypoints = repmat(initialGuess, numWaypoints, 1); % joint position waypoints
+    
+    rArmJointNames = rGoalMsg.Trajectory.JointNames;
+    rArmJntPosWaypoints = zeros(numWaypoints, numel(rArmJointNames));
+    
+    
+%Obliczenie pozycji polaczen dla kazdego punktu pozycji efektora koncowego wykorzystujac kinematyke odwrotna
+    for k = 1:numWaypoints
+        jntPos = ik(endEffectorName, TWaypoints(:,:,k), weights, initialGuess);
+        jntPosWaypoints(k, :) = jntPos;
+        initialGuess = jntPos;
+        
+        % Wyciagniecie pozycji polaczen prawej reki z obiektu jntPos
+        rArmJointPos = zeros(size(rArmJointNames));
+        for n = 1:length(rArmJointNames)
+            rn = rArmJointNames{n};
+            idx = strcmp({jntPos.JointName}, rn);
+            rArmJointPos(n) = jntPos(idx).JointPosition;
+        end  
+        rArmJntPosWaypoints(k,:) = rArmJointPos'; 
+    end
+    
+    
+%Punkty czasowe korespondujace z kazdym punktem trasy
+    timePoints = linspace(0,3,numWaypoints);
+        
+    
+%Oszacowanie prędkości trajektorii numerycznie
+    h = diff(timePoints); h = h(1);
+    jntTrajectoryPoints = arrayfun(@(~) rosmessage('trajectory_msgs/JointTrajectoryPoint'), zeros(1,numWaypoints)); 
+    [~, rArmJntVelWaypoints] = gradient(rArmJntPosWaypoints, h);
+    for m = 1:numWaypoints
+        jntTrajectoryPoints(m).Positions = rArmJntPosWaypoints(m,:);
+        jntTrajectoryPoints(m).Velocities = rArmJntVelWaypoints(m,:);
+        jntTrajectoryPoints(m).TimeFromStart = rosduration(timePoints(m));
+    end
+    
+   
+%Wizualizacja ruchu robota oraz trajektorii efektora koncowego
+    hold on
+    for j = 1:numWaypoints
+        show(pr2, jntPosWaypoints(j,:),'PreservePlot', false);
+        exampleHelperShowEndEffectorPos(TWaypoints(:,:,j));
+        drawnow;
+        pause(0.1);
+    end
+    
+    % Wyslanie trajektorii prawej reki do robota
+    rGoalMsg.Trajectory.Points = jntTrajectoryPoints;
+    sendGoalAndWait(rArm, rGoalMsg);
+
+end
+
+%Powrot do pozycji wyjsciowej
+exampleHelperSendPR2GripperCommand('r',0.0,-1)
+rGoalMsg.Trajectory.Points = tjPoint2;
+sendGoal(rArm, rGoalMsg);
